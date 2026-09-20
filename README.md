@@ -39,17 +39,24 @@ Autonomous-Taxi/
 
 ## External dependencies
 
-Third-party ROS packages are declared in `dependencies.repos`. They are downloaded with vcstool and are not committed directly to this repository.
+Third-party ROS packages are declared in:
+
+`dependencies.repos`
+
+They are downloaded with vcstool and are not committed directly to this repository.
 
 The SLAMTEC ROS 2 driver currently requires a small compatibility patch for ROS 2 Lyrical:
+
 `patches/sllidar_ros2-lyrical.patch`
 
 The complete dependency setup is automated by:
+
 ```bash
 ./scripts/setup_dependencies.sh
 ```
 
 Before running the script for the first time, rosdep must be initialized:
+
 ```bash
 sudo rosdep init
 rosdep update
@@ -58,16 +65,19 @@ rosdep update
 ## Build
 
 Source ROS 2:
+
 ```bash
 source /opt/ros/lyrical/setup.bash
 ```
 
 Configure external dependencies:
+
 ```bash
 ./scripts/setup_dependencies.sh
 ```
 
 Build the workspace:
+
 ```bash
 cd ros2_ws
 colcon build --symlink-install
@@ -76,17 +86,30 @@ source install/setup.bash
 
 ## RPLIDAR A2M8
 
-The LiDAR is connected through USB and normally appears as: `/dev/ttyUSB0`
-The A2M8 uses a serial baud rate of: `115200`
+The LiDAR is connected through USB and normally appears as:
+
+`/dev/ttyUSB0`
+
+The A2M8 uses a serial baud rate of:
+
+`115200`
 
 Start the ROS 2 driver:
+
 ```bash
 ros2 launch sllidar_ros2 sllidar_a2m8_launch.py
 ```
 
-The driver publishes `/scan` using `sensor_msgs/msg/LaserScan`.
+The driver publishes:
+
+`/scan`
+
+using:
+
+`sensor_msgs/msg/LaserScan`
 
 Basic validation commands:
+
 ```bash
 ros2 topic info /scan
 ros2 topic hz /scan
@@ -95,6 +118,63 @@ ros2 topic echo /scan --once
 
 The current hardware test produced valid 360-degree scans using the Sensitivity scan mode.
 
+## Gamepad Teleoperation
+
+Manual teleoperation is available through a USB/wireless gamepad.
+
+Currently validated controller:
+
+- 8BitDo Ultimate 2C Wireless Controller
+
+The ROS 2 data flow is:
+
+```text
+Gamepad
+  ↓
+joy_node
+  ↓ /joy
+gamepad_teleop
+  ↓ /cmd_vel
+```
+
+The controller mapping is stored in:
+
+`ros2_ws/src/taxi_teleop/config/8bitdo_ultimate_2c.yaml`
+
+Current mapping:
+
+- Left stick horizontal: steering
+- RT: forward throttle
+- LT: reverse throttle
+- LB: deadman / enable button
+
+Safety mechanisms:
+
+- Releasing the deadman button immediately commands zero velocity.
+- A joystick watchdog commands zero velocity if `/joy` messages stop arriving.
+
+Start teleoperation with:
+
+```bash
+cd ros2_ws
+source install/setup.bash
+ros2 launch taxi_teleop gamepad_teleop.launch.py
+```
+
+The resulting vehicle command is published on:
+
+`/cmd_vel`
+
+using:
+
+`geometry_msgs/msg/Twist`
+
+At this stage `/cmd_vel` is validated in software only. Integration with the STM32 and the physical vehicle is still pending.
+
 ## Current status
 
-RPLIDAR A2M8 hardware communication and ROS 2 integration have been validated. Next steps include LiDAR visualization, robot coordinate frames, mapping and navigation.
+- RPLIDAR A2M8 communication validated.
+- ROS 2 `/scan` publishing validated.
+- Reproducible dependency setup validated.
+- Gamepad teleoperation validated up to `/cmd_vel`.
+- STM32 and physical vehicle control integration pending.
