@@ -21,3 +21,6 @@ __pycache__/
 .env
 *.key
 *.pem
+
+#Third-party ROS dependencies managed by vcstool
+ros2_ws/src/third_party/
