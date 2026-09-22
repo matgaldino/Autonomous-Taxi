@@ -37,15 +37,19 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-#define STEERING_LEFT_US       1100
-#define STEERING_CENTER_US     1400
-#define STEERING_RIGHT_US      1700
+#define STEERING_NEG_US          1100
+#define STEERING_CENTER_US       1400
+#define STEERING_POS_US          1700
 
-#define ESC_MIN_US             1100
-#define ESC_NEUTRAL_US         1500
-#define ESC_MAX_US             1900
+#define ESC_FULL_REVERSE_US      1100
+#define ESC_REVERSE_START_US     1200
+#define ESC_NEUTRAL_US           1500
+#define ESC_FORWARD_START_US     1600
+#define ESC_FULL_FORWARD_US      1900
 
-#define PWM_STEP_US            25
+#define COMMAND_MAX              1000
+#define UART_BUFFER_SIZE         64
+#define SERIAL_WATCHDOG_MS       500
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -54,11 +58,24 @@ TIM_HandleTypeDef htim1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-uint16_t steering_us = STEERING_CENTER_US;
-uint16_t esc_us = ESC_NEUTRAL_US;
-
 uint8_t rx_byte;
-char uart_buffer[128];
+
+char rx_buffer[UART_BUFFER_SIZE];
+uint8_t rx_index = 0;
+
+uint32_t last_command_ms = 0;
+uint8_t watchdog_active = 0;
+
+int16_t steering_cmd = 0;
+int16_t throttle_cmd = 0;
+
+uint16_t steering_pwm = STEERING_CENTER_US;
+uint16_t esc_pwm = ESC_NEUTRAL_US;
+
+int8_t drive_direction = 0;
+// -1 = reverse
+//  0 = neutral
+// +1 = forward
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -72,53 +89,163 @@ static void MX_USART2_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-static void uart_send(const char *text)
+static int16_t clamp_command(int value)
 {
+    if (value > COMMAND_MAX)
+        return COMMAND_MAX;
+
+    if (value < -COMMAND_MAX)
+        return -COMMAND_MAX;
+
+    return (int16_t)value;
+}
+
+
+static uint16_t steering_to_pwm(int16_t command)
+{
+    if (command > 0)
+    {
+        return STEERING_CENTER_US +
+            ((uint32_t)command *
+            (STEERING_POS_US - STEERING_CENTER_US)) /
+            COMMAND_MAX;
+    }
+
+    if (command < 0)
+    {
+        return STEERING_CENTER_US -
+            ((uint32_t)(-command) *
+            (STEERING_CENTER_US - STEERING_NEG_US)) /
+            COMMAND_MAX;
+    }
+
+    return STEERING_CENTER_US;
+}
+
+
+static uint16_t throttle_to_pwm(int16_t command)
+{
+    if (command > 0)
+    {
+        return ESC_FORWARD_START_US +
+            ((uint32_t)command *
+            (ESC_FULL_FORWARD_US - ESC_FORWARD_START_US)) /
+            COMMAND_MAX;
+    }
+
+    if (command < 0)
+    {
+        return ESC_REVERSE_START_US -
+            ((uint32_t)(-command) *
+            (ESC_REVERSE_START_US - ESC_FULL_REVERSE_US)) /
+            COMMAND_MAX;
+    }
+
+    return ESC_NEUTRAL_US;
+}
+
+
+static void apply_vehicle_command(int16_t steering, int16_t throttle)
+{
+    steering = clamp_command(steering);
+    throttle = clamp_command(throttle);
+
+    steering_cmd = steering;
+    throttle_cmd = throttle;
+
+    steering_pwm = steering_to_pwm(steering);
+
+    __HAL_TIM_SET_COMPARE(
+        &htim1,
+        TIM_CHANNEL_1,
+        steering_pwm
+    );
+
+    int8_t requested_direction = 0;
+
+    if (throttle > 0)
+        requested_direction = 1;
+    else if (throttle < 0)
+        requested_direction = -1;
+
+    /*
+     * Direct direction change:
+     *
+     * forward -> reverse
+     * reverse -> forward
+     *
+     * Force an explicit neutral cycle first.
+     */
+    if (
+        drive_direction != 0 &&
+        requested_direction != 0 &&
+        requested_direction != drive_direction
+    )
+    {
+        esc_pwm = ESC_NEUTRAL_US;
+        drive_direction = 0;
+
+        __HAL_TIM_SET_COMPARE(
+            &htim1,
+            TIM_CHANNEL_4,
+            esc_pwm
+        );
+
+        return;
+    }
+
+    esc_pwm = throttle_to_pwm(throttle);
+
+    __HAL_TIM_SET_COMPARE(
+        &htim1,
+        TIM_CHANNEL_4,
+        esc_pwm
+    );
+
+    drive_direction = requested_direction;
+}
+
+
+static void send_status(void)
+{
+    char buffer[128];
+
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "OK S=%d T=%d SPWM=%u EPWM=%u\r\n",
+        steering_cmd,
+        throttle_cmd,
+        steering_pwm,
+        esc_pwm
+    );
+
     HAL_UART_Transmit(
         &huart2,
-        (uint8_t *)text,
-        strlen(text),
+        (uint8_t *)buffer,
+        strlen(buffer),
         HAL_MAX_DELAY
     );
 }
 
 
-static void print_status(void)
+static void process_command(char *line)
 {
-    snprintf(
-        uart_buffer,
-        sizeof(uart_buffer),
-        "\r\nSteering: %u us | ESC: %u us\r\n",
-        steering_us,
-        esc_us
-    );
+    int steering;
+    int throttle;
 
-    uart_send(uart_buffer);
-}
+    if (sscanf(line, "C,%d,%d", &steering, &throttle) == 2)
+    {
+        apply_vehicle_command(
+            (int16_t)steering,
+            (int16_t)throttle
+        );
 
+        last_command_ms = HAL_GetTick();
+        watchdog_active = 0;
 
-static void print_help(void)
-{
-    uart_send(
-        "\r\n"
-        "=== Autonomous Taxi Calibration ===\r\n"
-        "\r\n"
-        "STEERING:\r\n"
-        "  + : +25 us\r\n"
-        "  - : -25 us\r\n"
-        "  c : center (1400 us)\r\n"
-        "\r\n"
-        "ESC:\r\n"
-        "  u : +25 us\r\n"
-        "  d : -25 us\r\n"
-        "  n : neutral (1500 us)\r\n"
-        "  f : full forward (1900 us)\r\n"
-        "  b : low endpoint (1100 us)\r\n"
-        "\r\n"
-        "OTHER:\r\n"
-        "  p : print current values\r\n"
-        "  h : help\r\n"
-    );
+        send_status();
+    }
 }
 /* USER CODE END 0 */
 
@@ -154,25 +281,12 @@ int main(void)
   MX_TIM1_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); // steering
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4); // ESC
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
 
-  __HAL_TIM_SET_COMPARE(
-      &htim1,
-      TIM_CHANNEL_1,
-      steering_us
-  );
+  apply_vehicle_command(0, 0);
 
-  __HAL_TIM_SET_COMPARE(
-      &htim1,
-      TIM_CHANNEL_4,
-      esc_us
-  );
-
-  HAL_Delay(500);
-
-  print_help();
-  print_status();
+  last_command_ms = HAL_GetTick();
   /* USER CODE END 2 */
 
   /* Initialize leds */
@@ -182,87 +296,40 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  if (HAL_UART_Receive(&huart2, &rx_byte, 1, 50) == HAL_OK)
+	  if (HAL_UART_Receive(&huart2, &rx_byte, 1, 1) == HAL_OK)
 	      {
-	          switch (rx_byte)
+	          if (rx_byte == '\n' || rx_byte == '\r')
 	          {
-	              /* Steering */
+	              if (rx_index > 0)
+	              {
+	                  rx_buffer[rx_index] = '\0';
 
-	              case '+':
-	                  if (steering_us + PWM_STEP_US <= STEERING_RIGHT_US)
-	                  {
-	                      steering_us += PWM_STEP_US;
-	                  }
-	                  break;
+	                  process_command(rx_buffer);
 
-	              case '-':
-	                  if (steering_us >= STEERING_LEFT_US + PWM_STEP_US)
-	                  {
-	                      steering_us -= PWM_STEP_US;
-	                  }
-	                  break;
-
-	              case 'c':
-	                  steering_us = STEERING_CENTER_US;
-	                  break;
-
-
-	              /* ESC */
-
-	              case 'u':
-	                  if (esc_us + PWM_STEP_US <= ESC_MAX_US)
-	                  {
-	                      esc_us += PWM_STEP_US;
-	                  }
-	                  break;
-
-	              case 'd':
-	                  if (esc_us >= ESC_MIN_US + PWM_STEP_US)
-	                  {
-	                      esc_us -= PWM_STEP_US;
-	                  }
-	                  break;
-
-	              case 'n':
-	                  esc_us = ESC_NEUTRAL_US;
-	                  break;
-
-	              case 'f':
-	                  esc_us = ESC_MAX_US;
-	                  break;
-
-	              case 'b':
-	                  esc_us = ESC_MIN_US;
-	                  break;
-
-
-	              /* Utility */
-
-	              case 'p':
-	                  print_status();
-	                  continue;
-
-	              case 'h':
-	                  print_help();
-	                  continue;
-
-	              default:
-	                  continue;
+	                  rx_index = 0;
+	              }
 	          }
+	          else
+	          {
+	              if (rx_index < UART_BUFFER_SIZE - 1)
+	              {
+	                  rx_buffer[rx_index++] = rx_byte;
+	              }
+	              else
+	              {
+	                  rx_index = 0;
+	              }
+	          }
+	      }
 
-	          __HAL_TIM_SET_COMPARE(
-	              &htim1,
-	              TIM_CHANNEL_1,
-	              steering_us
-	          );
+	      if (
+	          !watchdog_active &&
+	          (HAL_GetTick() - last_command_ms > SERIAL_WATCHDOG_MS)
+	      )
+	      {
+	          apply_vehicle_command(0, 0);
 
-	          __HAL_TIM_SET_COMPARE(
-	              &htim1,
-	              TIM_CHANNEL_4,
-	              esc_us
-	          );
-
-	          print_status();
+	          watchdog_active = 1;
 	      }
     /* USER CODE END WHILE */
 
