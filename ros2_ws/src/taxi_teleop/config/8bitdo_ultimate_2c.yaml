@@ -5,7 +5,7 @@ gamepad_teleop:
     rt_axis: 5
     deadman_button: 4
 
-    max_linear_speed: 1.0
+    max_linear_speed: 0.3
     max_angular_speed: 1.0
 
     throttle_deadzone: 0.05
