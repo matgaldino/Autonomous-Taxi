@@ -24,3 +24,7 @@ __pycache__/
 
 #Third-party ROS dependencies managed by vcstool
 ros2_ws/src/third_party/
+
+# STM32CubeIDE build artifacts
+firmware/**/Debug/
+firmware/**/Release/
