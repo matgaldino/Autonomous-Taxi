@@ -105,17 +105,17 @@ static uint16_t steering_to_pwm(int16_t command)
 {
     if (command > 0)
     {
-        return STEERING_CENTER_US +
+        return STEERING_CENTER_US -
             ((uint32_t)command *
-            (STEERING_POS_US - STEERING_CENTER_US)) /
+            (STEERING_CENTER_US - STEERING_NEG_US)) /
             COMMAND_MAX;
     }
 
     if (command < 0)
     {
-        return STEERING_CENTER_US -
+        return STEERING_CENTER_US +
             ((uint32_t)(-command) *
-            (STEERING_CENTER_US - STEERING_NEG_US)) /
+            (STEERING_POS_US - STEERING_CENTER_US)) /
             COMMAND_MAX;
     }
 
