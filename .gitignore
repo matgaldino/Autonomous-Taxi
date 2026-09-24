@@ -28,3 +28,6 @@ ros2_ws/src/third_party/
 # STM32CubeIDE build artifacts
 firmware/**/Debug/
 firmware/**/Release/
+
+# STM32CubeIDE local preferences
+firmware/**/.settings/com.st.stm32cube.ide.mcu.sfrview.prefs
