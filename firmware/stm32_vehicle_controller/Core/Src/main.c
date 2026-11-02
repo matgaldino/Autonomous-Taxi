@@ -53,6 +53,8 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
+
 TIM_HandleTypeDef htim1;
 
 UART_HandleTypeDef huart2;
@@ -83,12 +85,197 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_I2C1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void mpu9250_read_config(void)
+{
+    uint8_t accel_config = 0;
+    uint8_t gyro_config = 0;
+    char buffer[80];
+
+    HAL_I2C_Mem_Read(
+        &hi2c1,
+        0x68 << 1,
+        0x1C,
+        I2C_MEMADD_SIZE_8BIT,
+        &accel_config,
+        1,
+        100
+    );
+
+    HAL_I2C_Mem_Read(
+        &hi2c1,
+        0x68 << 1,
+        0x1B,
+        I2C_MEMADD_SIZE_8BIT,
+        &gyro_config,
+        1,
+        100
+    );
+
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "ACCEL_CONFIG=0x%02X GYRO_CONFIG=0x%02X\r\n",
+        accel_config,
+        gyro_config
+    );
+
+    HAL_UART_Transmit(
+        &huart2,
+        (uint8_t *)buffer,
+        strlen(buffer),
+        HAL_MAX_DELAY
+    );
+}
+
+static void mpu9250_read_raw(void)
+{
+    uint8_t data[14];
+    char buffer[160];
+
+    if (HAL_I2C_Mem_Read(
+            &hi2c1,
+            0x68 << 1,
+            0x3B,
+            I2C_MEMADD_SIZE_8BIT,
+            data,
+            14,
+            100) != HAL_OK)
+    {
+        return;
+    }
+
+    int16_t ax = (int16_t)((data[0] << 8) | data[1]);
+    int16_t ay = (int16_t)((data[2] << 8) | data[3]);
+    int16_t az = (int16_t)((data[4] << 8) | data[5]);
+
+    int16_t gx = (int16_t)((data[8] << 8) | data[9]);
+    int16_t gy = (int16_t)((data[10] << 8) | data[11]);
+    int16_t gz = (int16_t)((data[12] << 8) | data[13]);
+
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "ACC %d %d %d | GYRO %d %d %d\r\n",
+        ax, ay, az,
+        gx, gy, gz
+    );
+
+    HAL_UART_Transmit(
+        &huart2,
+        (uint8_t *)buffer,
+        strlen(buffer),
+        HAL_MAX_DELAY
+    );
+}
+
+static void mpu9250_init(void)
+{
+    uint8_t data = 0x00;
+
+    HAL_I2C_Mem_Write(
+        &hi2c1,
+        0x68 << 1,
+        0x6B, // PWR_MGMT_1
+        I2C_MEMADD_SIZE_8BIT,
+        &data,
+        1,
+        100
+    );
+
+    HAL_Delay(100);
+}
+
+static void mpu9250_check(void)
+{
+    uint8_t who_am_i = 0;
+    char buffer[64];
+
+    HAL_StatusTypeDef status = HAL_I2C_Mem_Read(
+        &hi2c1,
+        0x68 << 1,
+        0x75,
+        I2C_MEMADD_SIZE_8BIT,
+        &who_am_i,
+        1,
+        100
+    );
+
+    if (status == HAL_OK)
+    {
+        snprintf(
+            buffer,
+            sizeof(buffer),
+            "MPU-9250 WHO_AM_I = 0x%02X\r\n",
+            who_am_i
+        );
+    }
+    else
+    {
+        snprintf(
+            buffer,
+            sizeof(buffer),
+            "MPU-9250 read error\r\n"
+        );
+    }
+
+    HAL_UART_Transmit(
+        &huart2,
+        (uint8_t *)buffer,
+        strlen(buffer),
+        HAL_MAX_DELAY
+    );
+}
+
+static void i2c_scan(void)
+{
+    char buffer[64];
+
+    HAL_UART_Transmit(
+        &huart2,
+        (uint8_t *)"\r\nI2C scan start\r\n",
+        strlen("\r\nI2C scan start\r\n"),
+        HAL_MAX_DELAY
+    );
+
+    for (uint8_t address = 1; address < 128; address++)
+    {
+        if (HAL_I2C_IsDeviceReady(
+                &hi2c1,
+                address << 1,
+                2,
+                10) == HAL_OK)
+        {
+            snprintf(
+                buffer,
+                sizeof(buffer),
+                "Found device at 0x%02X\r\n",
+                address
+            );
+
+            HAL_UART_Transmit(
+                &huart2,
+                (uint8_t *)buffer,
+                strlen(buffer),
+                HAL_MAX_DELAY
+            );
+        }
+    }
+
+    HAL_UART_Transmit(
+        &huart2,
+        (uint8_t *)"I2C scan complete\r\n",
+        strlen("I2C scan complete\r\n"),
+        HAL_MAX_DELAY
+    );
+}
+
 static int16_t clamp_command(int value)
 {
     if (value > COMMAND_MAX)
@@ -280,6 +467,7 @@ int main(void)
   MX_GPIO_Init();
   MX_TIM1_Init();
   MX_USART2_UART_Init();
+  MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
@@ -287,6 +475,10 @@ int main(void)
   apply_vehicle_command(0, 0);
 
   last_command_ms = HAL_GetTick();
+  i2c_scan();
+  mpu9250_check();
+  mpu9250_init();
+  mpu9250_read_config();
   /* USER CODE END 2 */
 
   /* Initialize leds */
@@ -331,6 +523,9 @@ int main(void)
 
 	          watchdog_active = 1;
 	      }
+	      mpu9250_read_raw();
+	      HAL_Delay(500);
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -386,6 +581,54 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.Timing = 0x00B07CB4;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Analogue filter
+  */
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Digital filter
+  */
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
 }
 
 /**
@@ -511,6 +754,7 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
