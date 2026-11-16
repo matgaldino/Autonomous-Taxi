@@ -38,6 +38,7 @@
 #define MPU9250_TIMEOUT_MS    10
 #define MPU9250_ACCEL_XOUT_H   0x3B
 #define IMU_PERIOD_MS         100
+#define UART_RX_RING_SIZE 256
 
 /* USER CODE END PD */
 
@@ -102,6 +103,19 @@ static uint32_t last_imu_read_ms = 0;
 
 static int16_t ax, ay, az;
 static int16_t gx, gy, gz;
+
+static volatile uint8_t rx_ring[UART_RX_RING_SIZE];
+
+static volatile uint8_t rx_head = 0;
+static volatile uint8_t rx_tail = 0;
+
+static volatile uint8_t rx_fault = 0;
+static uint8_t rx_discard = 0;
+
+
+static volatile uint32_t rx_count = 0;
+static volatile uint32_t rx_error = 0;
+static uint32_t last_debug_ms = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -412,6 +426,11 @@ int main(void)
       strlen(msg),
       20
   );
+
+  if (HAL_UART_Receive_IT(&huart2, &rx_byte, 1) != HAL_OK)
+  {
+      rx_fault = 1;
+  }
   /* USER CODE END 2 */
 
   /* Initialize leds */
@@ -474,41 +493,69 @@ int main(void)
 	      }
 	  }
 
-	  if (HAL_UART_Receive(&huart2, &rx_byte, 1, 1) == HAL_OK)
+	  while (!rx_fault && rx_tail != rx_head)
+	  {
+	      uint8_t byte = rx_ring[rx_tail];
+	      rx_tail = (uint8_t)(rx_tail + 1);
+
+	      if (byte == '\n' || byte == '\r')
 	      {
-	          if (rx_byte == '\n' || rx_byte == '\r')
+	          if (!rx_discard && rx_index > 0 && !rx_fault)
 	          {
-	              if (rx_index > 0)
-	              {
-	                  rx_buffer[rx_index] = '\0';
+	              rx_buffer[rx_index] = '\0';
+	              process_command(rx_buffer);
+	          }
 
-	                  process_command(rx_buffer);
-
-	                  rx_index = 0;
-	              }
+	          rx_index = 0;
+	          rx_discard = 0;
+	      }
+	      else if (!rx_discard)
+	      {
+	          if (rx_index < UART_BUFFER_SIZE - 1)
+	          {
+	              rx_buffer[rx_index++] = byte;
 	          }
 	          else
 	          {
-	              if (rx_index < UART_BUFFER_SIZE - 1)
-	              {
-	                  rx_buffer[rx_index++] = rx_byte;
-	              }
-	              else
-	              {
-	                  rx_index = 0;
-	              }
+	              rx_index = 0;
+	              rx_discard = 1;
 	          }
 	      }
+	  }
 
-	      if (
-	          !watchdog_active &&
-	          (HAL_GetTick() - last_command_ms > SERIAL_WATCHDOG_MS)
-	      )
-	      {
-	          apply_vehicle_command(0, 0);
+	  if (rx_fault && !watchdog_active)
+	  {
+	      apply_vehicle_command(0, 0);
+	      watchdog_active = 1;
+	  }
 
-	          watchdog_active = 1;
-	      }
+	  if (
+		  !watchdog_active &&
+		  (HAL_GetTick() - last_command_ms > SERIAL_WATCHDOG_MS)
+	  )
+	  {
+		  apply_vehicle_command(0, 0);
+
+		  watchdog_active = 1;
+	  }
+	  if (HAL_GetTick() - last_debug_ms >= 1000)
+	  {
+		  last_debug_ms = HAL_GetTick();
+
+		  char msg[100];
+
+		  int len = snprintf(
+			  msg, sizeof(msg),
+			  "DEBUG RX=%lu FAULT=%u ERROR=0x%lX\r\n",
+			  (unsigned long)rx_count,
+			  (unsigned int)rx_fault,
+			  (unsigned long)rx_error
+		  );
+
+		  HAL_UART_Transmit(
+			  &huart2, (uint8_t *)msg, len, 10
+		  );
+	  }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -837,7 +884,43 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance != USART2)
+        return;
 
+
+    rx_count++;
+
+
+    if (rx_fault)
+        return;
+
+    uint8_t next = (uint8_t)(rx_head + 1);
+
+    if (next == rx_tail)
+    {
+        rx_fault = 1;
+        return;
+    }
+
+    rx_ring[rx_head] = rx_byte;
+    rx_head = next;
+
+    if (HAL_UART_Receive_IT(&huart2, &rx_byte, 1) != HAL_OK)
+    {
+        rx_fault = 1;
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2)
+    {
+        rx_error = HAL_UART_GetError(huart);
+        rx_fault = 1;
+    }
+}
 /* USER CODE END 4 */
 
 /**
