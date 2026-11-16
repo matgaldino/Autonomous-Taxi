@@ -83,6 +83,12 @@ int8_t drive_direction = 0;
 // +1 = forward
 
 static uint32_t last_encoder_print_ms = 0;
+
+static uint32_t prev_left = 0;
+static uint16_t prev_right = 0;
+
+static int64_t total_left = 0;
+static int64_t total_right = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -310,6 +316,9 @@ int main(void)
   {
       Error_Handler();
   }
+
+  prev_left = __HAL_TIM_GET_COUNTER(&htim2);
+  prev_right = HAL_LPTIM_ReadCounter(&hlptim1);
   /* USER CODE END 2 */
 
   /* Initialize leds */
@@ -323,16 +332,32 @@ int main(void)
 	  {
 	      last_encoder_print_ms = HAL_GetTick();
 
-	      int32_t left = (int32_t)__HAL_TIM_GET_COUNTER(&htim2);
-	      int16_t right = (int16_t)HAL_LPTIM_ReadCounter(&hlptim1);
+	      uint32_t left = __HAL_TIM_GET_COUNTER(&htim2);
+	      uint16_t right = HAL_LPTIM_ReadCounter(&hlptim1);
 
-	      char msg[80];
+	      // Confirm LPTIM counter reading
+	      if (right == HAL_LPTIM_ReadCounter(&hlptim1))
+	      {
+	          // Compute signed differences with wraparound
+	          int32_t delta_left = (int32_t)(left - prev_left);
+	          int16_t delta_right = (int16_t)(right - prev_right);
 
-	      int len = snprintf(msg, sizeof(msg),
-	                         "ENC L=%ld R=%d\r\n",
-	                         (long)left, (int)right);
+	          // Accumulate counts
+	          total_left += delta_left;
+	          total_right += delta_right;
 
-	      HAL_UART_Transmit(&huart2, (uint8_t *)msg, len, 10);
+	          prev_left = left;
+	          prev_right = right;
+
+	          char msg[80];
+
+	          int len = snprintf(msg, sizeof(msg),
+	                             "ENC L=%ld R=%ld\r\n",
+	                             (long)total_left,
+	                             (long)total_right);
+
+	          HAL_UART_Transmit(&huart2, (uint8_t *)msg, len, 10);
+	      }
 	  }
 	  if (HAL_UART_Receive(&huart2, &rx_byte, 1, 1) == HAL_OK)
 	      {
