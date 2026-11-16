@@ -32,6 +32,12 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define MPU9250_ADDR          (0x68 << 1)
+#define MPU9250_WHO_AM_I      0x75
+#define MPU9250_PWR_MGMT_1    0x6B
+#define MPU9250_TIMEOUT_MS    10
+#define MPU9250_ACCEL_XOUT_H   0x3B
+#define IMU_PERIOD_MS         100
 
 /* USER CODE END PD */
 
@@ -89,6 +95,13 @@ static uint16_t prev_right = 0;
 
 static int64_t total_left = 0;
 static int64_t total_right = 0;
+
+static uint8_t imu_ready = 0;
+
+static uint32_t last_imu_read_ms = 0;
+
+static int16_t ax, ay, az;
+static int16_t gx, gy, gz;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -105,6 +118,73 @@ static void MX_TIM2_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static uint8_t mpu9250_read_raw(void)
+{
+    uint8_t data[14];
+
+    if (HAL_I2C_Mem_Read(
+            &hi2c1,
+            MPU9250_ADDR,
+            MPU9250_ACCEL_XOUT_H,
+            I2C_MEMADD_SIZE_8BIT,
+            data,
+            14,
+            MPU9250_TIMEOUT_MS) != HAL_OK)
+    {
+        return 0;
+    }
+
+    ax = (int16_t)((data[0] << 8) | data[1]);
+    ay = (int16_t)((data[2] << 8) | data[3]);
+    az = (int16_t)((data[4] << 8) | data[5]);
+
+    gx = (int16_t)((data[8] << 8) | data[9]);
+    gy = (int16_t)((data[10] << 8) | data[11]);
+    gz = (int16_t)((data[12] << 8) | data[13]);
+
+    return 1;
+}
+
+
+static uint8_t mpu9250_init(void)
+{
+    uint8_t who_am_i = 0;
+
+    if (HAL_I2C_Mem_Read(
+            &hi2c1,
+            MPU9250_ADDR,
+            MPU9250_WHO_AM_I,
+            I2C_MEMADD_SIZE_8BIT,
+            &who_am_i,
+            1,
+            MPU9250_TIMEOUT_MS) != HAL_OK)
+    {
+        return 0;
+    }
+
+    if (who_am_i != 0x71)
+    {
+        return 0;
+    }
+
+    uint8_t data = 0x00;
+
+    if (HAL_I2C_Mem_Write(
+            &hi2c1,
+            MPU9250_ADDR,
+            MPU9250_PWR_MGMT_1,
+            I2C_MEMADD_SIZE_8BIT,
+            &data,
+            1,
+            MPU9250_TIMEOUT_MS) != HAL_OK)
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+
 static int16_t clamp_command(int value)
 {
     if (value > COMMAND_MAX)
@@ -319,6 +399,19 @@ int main(void)
 
   prev_left = __HAL_TIM_GET_COUNTER(&htim2);
   prev_right = HAL_LPTIM_ReadCounter(&hlptim1);
+
+  imu_ready = mpu9250_init();
+
+  const char *msg = imu_ready
+      ? "IMU OK\r\n"
+      : "IMU ERROR\r\n";
+
+  HAL_UART_Transmit(
+      &huart2,
+      (uint8_t *)msg,
+      strlen(msg),
+      20
+  );
   /* USER CODE END 2 */
 
   /* Initialize leds */
@@ -359,6 +452,28 @@ int main(void)
 	          HAL_UART_Transmit(&huart2, (uint8_t *)msg, len, 10);
 	      }
 	  }
+
+	  if (imu_ready &&
+	      HAL_GetTick() - last_imu_read_ms >= IMU_PERIOD_MS)
+	  {
+	      last_imu_read_ms = HAL_GetTick();
+
+	      if (mpu9250_read_raw())
+	      {
+	          char msg[100];
+
+	          int len = snprintf(
+	              msg, sizeof(msg),
+	              "IMU A=%d,%d,%d G=%d,%d,%d\r\n",
+	              ax, ay, az, gx, gy, gz
+	          );
+
+	          HAL_UART_Transmit(
+	              &huart2, (uint8_t *)msg, len, 10
+	          );
+	      }
+	  }
+
 	  if (HAL_UART_Receive(&huart2, &rx_byte, 1, 1) == HAL_OK)
 	      {
 	          if (rx_byte == '\n' || rx_byte == '\r')
