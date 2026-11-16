@@ -213,18 +213,44 @@ The control chain contains multiple safety layers:
 *   **Hardware Watchdog:** The STM32 has a 500 ms serial watchdog that returns steering to center and the ESC to neutral if communication with the Raspberry Pi is lost.
 *   **Isolation:** The ESC/servo power system uses the ESC BEC (measured at 6 V). The STM32 remains USB-powered and shares only ground with the vehicle electronics.
 
-## Current Status
+### Wheel Encoders
 
-**Validated Milestones:**
+Two E38S6G5-600B-G24N incremental rotary encoders
+are used for wheel odometry.
 
-- [x] ROS 2 Lyrical running on Raspberry Pi and development workstation
-- [x] Reproducible external dependency setup
-- [x] RPLIDAR A2M8 communication and `/scan` publishing 
-- [x] 8BitDo gamepad teleoperation (`/joy` to `/cmd_vel`)
-- [x] Raspberry Pi to STM32 USB serial communication (`taxi_serial_bridge`)
-- [x] Normalized serial vehicle-control protocol
-- [x] STM32 communication watchdog
-- [x] Steering servo and ESC PWM control
-- [x] End-to-end gamepad steering and throttle control (physical vehicle integration)
+- Resolution: 600 PPR (2400 counts/revolution with x4 decoding)
+- Wheel diameter: 61 mm
+- Left encoder: TIM2 (32-bit counter)
+- Right encoder: LPTIM1 (16-bit counter)
+- Power supply: 6 V from ESC BEC
+- Signal pull-ups: 4.7 kΩ to 3.3 V
+- Positive counting direction: forward motion
 
-*The vehicle control stack is currently configured with a conservative teleoperation speed limit for bench testing.*
+#### Pin Mapping
+
+| Component | Signal | Nucleo Pin | STM32 Pin |
+|-----------|--------|------------|-----------|
+| Left encoder | A | A1 | PA1 |
+| Left encoder | B | A0 | PA0 |
+| Right encoder | A | D11 | PB5 |
+| Right encoder | B | A4 | PB7 |
+| IMU | SDA | D0 | PA10 |
+| IMU | SCL | D1 | PA9 |
+| Steering servo | PWM | D9 | PA8 |
+| ESC | PWM | D10 | PA11 |
+
+#### Validation
+
+- [x] Electrical signals verified with oscilloscope
+- [x] Independent hardware counters
+- [x] Quadrature x4 decoding
+- [x] Forward and reverse counting
+- [x] Serial encoder telemetry at 10 Hz
+- [x] Compatibility with manual gamepad control
+- [ ] Counter overflow handling
+- [ ] ROS 2 encoder integration
+- [ ] Wheel odometry computation
+
+The I2C1 pins have been remapped to PA9 and PA10
+to avoid conflicts with LPTIM1. IMU integration
+on the new pins is pending validation.
