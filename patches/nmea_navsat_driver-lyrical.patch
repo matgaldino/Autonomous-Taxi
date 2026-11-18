@@ -1,0 +1,22 @@
+--- a/driver.py
++++ b/driver.py
+@@ -121,7 +121,7 @@
+     # nmea_string
+     def add_sentence(self, nmea_string, frame_id, timestamp=None):
+         if not check_nmea_checksum(nmea_string):
+-            self.get_logger().warn("Received a sentence with an invalid checksum. " +
++            self.get_logger().warning("Received a sentence with an invalid checksum. " +
+                                    "Sentence was: %s" % nmea_string)
+             return False
+ 
+--- a/nodes/nmea_serial_driver.py
++++ b/nodes/nmea_serial_driver.py
+@@ -57,7 +57,7 @@
+                         data = data.decode("utf-8")
+                     driver.add_sentence(data, frame_id)
+                 except ValueError as e:
+-                    driver.get_logger().warn(
++                    driver.get_logger().warning(
+                         "Value error, likely due to missing fields in the NMEA message. Error was: %s. "
+                         "Please report this issue at github.com/ros-drivers/nmea_navsat_driver, including a bag file "
+                         "with the NMEA sentences that caused it." % e)
