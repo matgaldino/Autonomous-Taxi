@@ -49,6 +49,27 @@
 #define ACCEL_SCALE_X   0.999424f
 #define ACCEL_SCALE_Y   1.000798f
 #define ACCEL_SCALE_Z   0.983851f
+
+#define MPU9250_USER_CTRL      0x6A
+#define MPU9250_INT_PIN_CFG    0x37
+
+#define AK8963_ADDR           (0x0C << 1)
+#define AK8963_WIA            0x00
+
+#define AK8963_ST1           0x02
+#define AK8963_HXL           0x03
+#define AK8963_CNTL1         0x0A
+#define AK8963_ASAX          0x10
+
+#define MAG_PERIOD_MS       100
+
+#define MAG_BIAS_X     34.956988f
+#define MAG_BIAS_Y     55.816963f
+#define MAG_BIAS_Z   -342.012000f
+
+#define MAG_SCALE_X    0.974791f
+#define MAG_SCALE_Y    1.038557f
+#define MAG_SCALE_Z    1.025115f
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -133,6 +154,18 @@ static float gz_corrected;
 static float ax_corrected;
 static float ay_corrected;
 static float az_corrected;
+
+static uint8_t mag_ready = 0;
+
+static uint32_t last_mag_read_ms = 0;
+
+static int16_t mx, my, mz;
+
+static float mag_adjust[3];
+
+static float mx_corrected;
+static float my_corrected;
+static float mz_corrected;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -149,6 +182,109 @@ static void MX_TIM2_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static uint8_t ak8963_detect(void)
+{
+    uint8_t data;
+
+    // Disable internal I2C master
+    data = 0x00;
+
+    if (HAL_I2C_Mem_Write(
+            &hi2c1,
+            MPU9250_ADDR,
+            MPU9250_USER_CTRL,
+            I2C_MEMADD_SIZE_8BIT,
+            &data, 1, MPU9250_TIMEOUT_MS) != HAL_OK)
+    {
+        return 0;
+    }
+
+    // Enable bypass mode
+    data = 0x02;
+
+    if (HAL_I2C_Mem_Write(
+            &hi2c1,
+            MPU9250_ADDR,
+            MPU9250_INT_PIN_CFG,
+            I2C_MEMADD_SIZE_8BIT,
+            &data, 1, MPU9250_TIMEOUT_MS) != HAL_OK)
+    {
+        return 0;
+    }
+
+    // Read magnetometer device ID
+    data = 0;
+
+    if (HAL_I2C_Mem_Read(
+            &hi2c1,
+            AK8963_ADDR,
+            AK8963_WIA,
+            I2C_MEMADD_SIZE_8BIT,
+            &data, 1, MPU9250_TIMEOUT_MS) != HAL_OK)
+    {
+        return 0;
+    }
+
+    return data == 0x48;
+}
+
+static uint8_t ak8963_set_mode(uint8_t mode)
+{
+    return HAL_I2C_Mem_Write(
+        &hi2c1,
+        AK8963_ADDR,
+        AK8963_CNTL1,
+        I2C_MEMADD_SIZE_8BIT,
+        &mode, 1, MPU9250_TIMEOUT_MS
+    ) == HAL_OK;
+}
+
+static uint8_t ak8963_init(void)
+{
+    uint8_t asa[3];
+
+    // Power-down mode
+    if (!ak8963_set_mode(0x00))
+        return 0;
+
+    HAL_Delay(1);
+
+    // Fuse ROM access mode
+    if (!ak8963_set_mode(0x0F))
+        return 0;
+
+    HAL_Delay(1);
+
+    // Read factory sensitivity adjustment
+    if (HAL_I2C_Mem_Read(
+            &hi2c1,
+            AK8963_ADDR,
+            AK8963_ASAX,
+            I2C_MEMADD_SIZE_8BIT,
+            asa, 3, MPU9250_TIMEOUT_MS) != HAL_OK)
+    {
+        return 0;
+    }
+
+    for (int i = 0; i < 3; i++)
+    {
+        mag_adjust[i] =
+            ((float)asa[i] - 128.0f) / 256.0f + 1.0f;
+    }
+
+    // Return to power-down mode
+    if (!ak8963_set_mode(0x00))
+        return 0;
+
+    HAL_Delay(1);
+
+    // Continuous measurement, 100 Hz, 16 bits
+    if (!ak8963_set_mode(0x16))
+        return 0;
+
+    return 1;
+}
+
 static uint8_t mpu9250_read_raw(void)
 {
     uint8_t data[14];
@@ -382,6 +518,53 @@ static void process_command(char *line)
         send_status();
     }
 }
+
+static uint8_t ak8963_read_raw(void)
+{
+    uint8_t status;
+    uint8_t data[7];
+
+    if (HAL_I2C_Mem_Read(
+            &hi2c1,
+            AK8963_ADDR,
+            AK8963_ST1,
+            I2C_MEMADD_SIZE_8BIT,
+            &status, 1, MPU9250_TIMEOUT_MS) != HAL_OK)
+    {
+        return 0;
+    }
+
+    // Check data ready
+    if (!(status & 0x01))
+        return 0;
+
+    // Read measurement and ST2
+    if (HAL_I2C_Mem_Read(
+            &hi2c1,
+            AK8963_ADDR,
+            AK8963_HXL,
+            I2C_MEMADD_SIZE_8BIT,
+            data, 7, MPU9250_TIMEOUT_MS) != HAL_OK)
+    {
+        return 0;
+    }
+
+    // Reject magnetic overflow
+    if (data[6] & 0x08)
+        return 0;
+
+    mx = (int16_t)((data[1] << 8) | data[0]);
+    my = (int16_t)((data[3] << 8) | data[2]);
+    mz = (int16_t)((data[5] << 8) | data[4]);
+
+    mx_corrected = (mx * mag_adjust[0] - MAG_BIAS_X) * MAG_SCALE_X;
+
+    my_corrected = (my * mag_adjust[1] - MAG_BIAS_Y) * MAG_SCALE_Y;
+
+    mz_corrected = (mz * mag_adjust[2] - MAG_BIAS_Z) * MAG_SCALE_Z;
+
+    return 1;
+}
 /* USER CODE END 0 */
 
 /**
@@ -456,6 +639,21 @@ int main(void)
   {
       rx_fault = 1;
   }
+
+  mag_ready = imu_ready &&
+              ak8963_detect() &&
+              ak8963_init();
+
+  const char *mag_msg = mag_ready
+      ? "MAG OK\r\n"
+      : "MAG ERROR\r\n";
+
+  HAL_UART_Transmit(
+      &huart2,
+      (uint8_t *)mag_msg,
+      strlen(mag_msg),
+      20
+  );
   /* USER CODE END 2 */
 
   /* Initialize leds */
@@ -515,6 +713,29 @@ int main(void)
 	              (int)gx_corrected,
 	              (int)gy_corrected,
 	              (int)gz_corrected
+	          );
+
+	          HAL_UART_Transmit(
+	              &huart2, (uint8_t *)msg, len, 10
+	          );
+	      }
+	  }
+
+	  if (mag_ready &&
+	      HAL_GetTick() - last_mag_read_ms >= MAG_PERIOD_MS)
+	  {
+	      last_mag_read_ms = HAL_GetTick();
+
+	      if (ak8963_read_raw())
+	      {
+	          char msg[80];
+
+	          int len = snprintf(
+	              msg, sizeof(msg),
+	              "MAG M=%d,%d,%d\r\n",
+	              (int)mx_corrected,
+	              (int)my_corrected,
+	              (int)mz_corrected
 	          );
 
 	          HAL_UART_Transmit(
