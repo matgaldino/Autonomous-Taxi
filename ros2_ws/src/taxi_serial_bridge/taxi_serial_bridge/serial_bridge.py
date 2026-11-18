@@ -2,6 +2,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 import math
+from copy import deepcopy
 
 from sensor_msgs.msg import Imu, MagneticField
 from taxi_interfaces.msg import WheelTicks
@@ -57,6 +58,13 @@ class SerialBridge(Node):
 
         self.rx_timer = self.create_timer(
             0.01, self.read_telemetry
+        )
+
+        self.previous_ticks = None
+        self.stationary_count = 0
+
+        self.imu_ekf_pub = self.create_publisher(
+            Imu, 'imu/data_ekf', 10
         )
 
     def cmd_vel_callback(self, msg):
@@ -142,6 +150,15 @@ class SerialBridge(Node):
         if not 0 <= timestamp_ms <= 0xFFFFFFFF:
             return
 
+        ticks = (left_ticks, right_ticks)
+
+        if ticks == self.previous_ticks:
+            self.stationary_count += 1
+        else:
+            self.stationary_count = 0
+
+        self.previous_ticks = ticks
+
         if imu_valid not in (0, 1) or mag_valid not in (0, 1):
             return
 
@@ -182,7 +199,22 @@ class SerialBridge(Node):
             # Orientation is not estimated yet
             imu.orientation_covariance[0] = -1.0
 
+            imu.angular_velocity_covariance = [
+                0.0004, 0.0,    0.0,
+                0.0,    0.0004, 0.0,
+                0.0,    0.0,    0.0004
+            ]
+
             self.imu_pub.publish(imu)
+            imu_ekf = deepcopy(imu)
+
+            if (
+                self.stationary_count >= 5
+                and abs(imu.angular_velocity.z) < 0.02
+            ):
+                imu_ekf.angular_velocity.z = 0.0
+
+            self.imu_ekf_pub.publish(imu_ekf)
 
         # Magnetometer
         if mag_valid:
