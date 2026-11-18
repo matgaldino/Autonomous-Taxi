@@ -37,7 +37,6 @@
 #define MPU9250_PWR_MGMT_1    0x6B
 #define MPU9250_TIMEOUT_MS    10
 #define MPU9250_ACCEL_XOUT_H   0x3B
-#define IMU_PERIOD_MS         100
 #define UART_RX_RING_SIZE 256
 #define GYRO_BIAS_X    (-93.59f)
 #define GYRO_BIAS_Y    (193.61f)
@@ -61,8 +60,6 @@
 #define AK8963_CNTL1         0x0A
 #define AK8963_ASAX          0x10
 
-#define MAG_PERIOD_MS       100
-
 #define MAG_BIAS_X     34.956988f
 #define MAG_BIAS_Y     55.816963f
 #define MAG_BIAS_Z   -342.012000f
@@ -70,6 +67,8 @@
 #define MAG_SCALE_X    0.974791f
 #define MAG_SCALE_Y    1.038557f
 #define MAG_SCALE_Z    1.025115f
+
+#define TELEMETRY_PERIOD_MS 100
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -119,8 +118,6 @@ int8_t drive_direction = 0;
 //  0 = neutral
 // +1 = forward
 
-static uint32_t last_encoder_print_ms = 0;
-
 static uint32_t prev_left = 0;
 static uint16_t prev_right = 0;
 
@@ -128,8 +125,6 @@ static int64_t total_left = 0;
 static int64_t total_right = 0;
 
 static uint8_t imu_ready = 0;
-
-static uint32_t last_imu_read_ms = 0;
 
 static int16_t ax, ay, az;
 static int16_t gx, gy, gz;
@@ -157,8 +152,6 @@ static float az_corrected;
 
 static uint8_t mag_ready = 0;
 
-static uint32_t last_mag_read_ms = 0;
-
 static int16_t mx, my, mz;
 
 static float mag_adjust[3];
@@ -166,6 +159,8 @@ static float mag_adjust[3];
 static float mx_corrected;
 static float my_corrected;
 static float mz_corrected;
+
+static uint32_t last_telemetry_ms = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -182,6 +177,30 @@ static void MX_TIM2_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void int64_to_string(int64_t value, char *out)
+{
+    char temp[21];
+    int i = 0;
+
+    uint64_t magnitude = value < 0
+        ? (uint64_t)(-(value + 1)) + 1
+        : (uint64_t)value;
+
+    if (value < 0)
+        *out++ = '-';
+
+    do
+    {
+        temp[i++] = '0' + magnitude % 10;
+        magnitude /= 10;
+    }
+    while (magnitude > 0);
+
+    while (i > 0)
+        *out++ = temp[--i];
+
+    *out = '\0';
+}
 static uint8_t ak8963_detect(void)
 {
     uint8_t data;
@@ -565,6 +584,70 @@ static uint8_t ak8963_read_raw(void)
 
     return 1;
 }
+
+static void telemetry_update(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    if (now - last_telemetry_ms < TELEMETRY_PERIOD_MS)
+        return;
+
+    last_telemetry_ms = now;
+
+    // Read encoders
+    uint32_t left = __HAL_TIM_GET_COUNTER(&htim2);
+    uint16_t right = HAL_LPTIM_ReadCounter(&hlptim1);
+
+    if (right != HAL_LPTIM_ReadCounter(&hlptim1))
+        return;
+
+    // Handle counter wraparound
+    total_left += (int32_t)(left - prev_left);
+    total_right += (int16_t)(right - prev_right);
+
+    prev_left = left;
+    prev_right = right;
+
+    // Read sensors
+    uint8_t imu_valid = imu_ready && mpu9250_read_raw();
+    uint8_t mag_valid = mag_ready && ak8963_read_raw();
+
+    // Format encoder counters
+    char left_str[22];
+    char right_str[22];
+
+    int64_to_string(total_left, left_str);
+    int64_to_string(total_right, right_str);
+
+    // Build telemetry packet
+    char msg[192];
+
+    int len = snprintf(
+        msg, sizeof(msg),
+        "T,%lu,%s,%s,%u,%d,%d,%d,%d,%d,%d,%u,%d,%d,%d\r\n",
+        (unsigned long)now,
+        left_str,
+        right_str,
+        (unsigned int)imu_valid,
+        imu_valid ? (int)ax_corrected : 0,
+        imu_valid ? (int)ay_corrected : 0,
+        imu_valid ? (int)az_corrected : 0,
+        imu_valid ? (int)gx_corrected : 0,
+        imu_valid ? (int)gy_corrected : 0,
+        imu_valid ? (int)gz_corrected : 0,
+        (unsigned int)mag_valid,
+        mag_valid ? (int)mx_corrected : 0,
+        mag_valid ? (int)my_corrected : 0,
+        mag_valid ? (int)mz_corrected : 0
+    );
+
+    if (len > 0 && len < (int)sizeof(msg))
+    {
+        HAL_UART_Transmit(
+            &huart2, (uint8_t *)msg, len, 20
+        );
+    }
+}
 /* USER CODE END 0 */
 
 /**
@@ -663,86 +746,7 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  if (HAL_GetTick() - last_encoder_print_ms >= 100)
-	  {
-	      last_encoder_print_ms = HAL_GetTick();
-
-	      uint32_t left = __HAL_TIM_GET_COUNTER(&htim2);
-	      uint16_t right = HAL_LPTIM_ReadCounter(&hlptim1);
-
-	      // Confirm LPTIM counter reading
-	      if (right == HAL_LPTIM_ReadCounter(&hlptim1))
-	      {
-	          // Compute signed differences with wraparound
-	          int32_t delta_left = (int32_t)(left - prev_left);
-	          int16_t delta_right = (int16_t)(right - prev_right);
-
-	          // Accumulate counts
-	          total_left += delta_left;
-	          total_right += delta_right;
-
-	          prev_left = left;
-	          prev_right = right;
-
-	          char msg[80];
-
-	          int len = snprintf(msg, sizeof(msg),
-	                             "ENC L=%ld R=%ld\r\n",
-	                             (long)total_left,
-	                             (long)total_right);
-
-	          HAL_UART_Transmit(&huart2, (uint8_t *)msg, len, 10);
-	      }
-	  }
-
-	  if (imu_ready &&
-	      HAL_GetTick() - last_imu_read_ms >= IMU_PERIOD_MS)
-	  {
-	      last_imu_read_ms = HAL_GetTick();
-
-	      if (mpu9250_read_raw())
-	      {
-	          char msg[100];
-
-	          int len = snprintf(
-	              msg, sizeof(msg),
-	              "IMU A=%d,%d,%d G=%d,%d,%d\r\n",
-	              (int)ax_corrected,
-	              (int)ay_corrected,
-	              (int)az_corrected,
-	              (int)gx_corrected,
-	              (int)gy_corrected,
-	              (int)gz_corrected
-	          );
-
-	          HAL_UART_Transmit(
-	              &huart2, (uint8_t *)msg, len, 10
-	          );
-	      }
-	  }
-
-	  if (mag_ready &&
-	      HAL_GetTick() - last_mag_read_ms >= MAG_PERIOD_MS)
-	  {
-	      last_mag_read_ms = HAL_GetTick();
-
-	      if (ak8963_read_raw())
-	      {
-	          char msg[80];
-
-	          int len = snprintf(
-	              msg, sizeof(msg),
-	              "MAG M=%d,%d,%d\r\n",
-	              (int)mx_corrected,
-	              (int)my_corrected,
-	              (int)mz_corrected
-	          );
-
-	          HAL_UART_Transmit(
-	              &huart2, (uint8_t *)msg, len, 10
-	          );
-	      }
-	  }
+	  telemetry_update();
 
 	  while (!rx_fault && rx_tail != rx_head)
 	  {
