@@ -39,7 +39,16 @@
 #define MPU9250_ACCEL_XOUT_H   0x3B
 #define IMU_PERIOD_MS         100
 #define UART_RX_RING_SIZE 256
+#define GYRO_BIAS_X    (-93.59f)
+#define GYRO_BIAS_Y    (193.61f)
+#define GYRO_BIAS_Z    (-44.02f)
+#define ACCEL_BIAS_X    433.2640f
+#define ACCEL_BIAS_Y    369.6160f
+#define ACCEL_BIAS_Z    4045.8200f
 
+#define ACCEL_SCALE_X   0.999424f
+#define ACCEL_SCALE_Y   1.000798f
+#define ACCEL_SCALE_Z   0.983851f
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -116,6 +125,14 @@ static uint8_t rx_discard = 0;
 static volatile uint32_t rx_count = 0;
 static volatile uint32_t rx_error = 0;
 static uint32_t last_debug_ms = 0;
+
+static float gx_corrected;
+static float gy_corrected;
+static float gz_corrected;
+
+static float ax_corrected;
+static float ay_corrected;
+static float az_corrected;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -155,6 +172,14 @@ static uint8_t mpu9250_read_raw(void)
     gx = (int16_t)((data[8] << 8) | data[9]);
     gy = (int16_t)((data[10] << 8) | data[11]);
     gz = (int16_t)((data[12] << 8) | data[13]);
+
+    gx_corrected = (float)gx - GYRO_BIAS_X;
+    gy_corrected = (float)gy - GYRO_BIAS_Y;
+    gz_corrected = (float)gz - GYRO_BIAS_Z;
+
+    ax_corrected = ((float)ax - ACCEL_BIAS_X) * ACCEL_SCALE_X;
+    ay_corrected = ((float)ay - ACCEL_BIAS_Y) * ACCEL_SCALE_Y;
+    az_corrected = ((float)az - ACCEL_BIAS_Z) * ACCEL_SCALE_Z;
 
     return 1;
 }
@@ -484,7 +509,12 @@ int main(void)
 	          int len = snprintf(
 	              msg, sizeof(msg),
 	              "IMU A=%d,%d,%d G=%d,%d,%d\r\n",
-	              ax, ay, az, gx, gy, gz
+	              (int)ax_corrected,
+	              (int)ay_corrected,
+	              (int)az_corrected,
+	              (int)gx_corrected,
+	              (int)gy_corrected,
+	              (int)gz_corrected
 	          );
 
 	          HAL_UART_Transmit(
