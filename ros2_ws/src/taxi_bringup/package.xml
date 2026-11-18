@@ -21,4 +21,7 @@
   <exec_depend>taxi_teleop</exec_depend>
   <exec_depend>taxi_serial_bridge</exec_depend>
   <exec_depend>taxi_odometry</exec_depend>
+
+  <exec_depend>taxi_description</exec_depend>
+  <exec_depend>rviz2</exec_depend>
 </package>
