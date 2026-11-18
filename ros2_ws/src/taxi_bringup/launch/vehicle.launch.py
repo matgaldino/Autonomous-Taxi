@@ -19,6 +19,16 @@ def generate_launch_description():
                 ])
             )
         ),
+        
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                PathJoinSubstitution([
+                    FindPackageShare('taxi_localization'),
+                    'launch',
+                    'localization.launch.py'
+                ])
+            )
+        ),
 
         Node(
             package='taxi_serial_bridge',
@@ -29,6 +39,7 @@ def generate_launch_description():
         Node(
             package='taxi_odometry',
             executable='wheel_odometry',
-            output='screen'
+            output='screen',
+            parameters=[{'publish_tf': False}]
         )
     ])

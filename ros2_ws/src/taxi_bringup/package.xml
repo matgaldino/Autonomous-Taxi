@@ -24,4 +24,6 @@
 
   <exec_depend>taxi_description</exec_depend>
   <exec_depend>rviz2</exec_depend>
+
+  <exec_depend>taxi_localization</exec_depend>
 </package>

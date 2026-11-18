@@ -23,12 +23,7 @@ if(BUILD_TESTING)
 endif()
 
 install(
-  DIRECTORY urdf launch rviz
-  DESTINATION share/${PROJECT_NAME}
-)
-
-install(
-  FILES LICENSE-F1TENTH
+  DIRECTORY urdf launch
   DESTINATION share/${PROJECT_NAME}
 )
 

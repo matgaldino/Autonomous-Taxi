@@ -11,8 +11,6 @@ from tf2_ros import TransformBroadcaster
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped
 
-from nav_msgs.msg import Path
-from geometry_msgs.msg import PoseStamped
 
 
 class WheelOdometry(Node):
@@ -24,7 +22,9 @@ class WheelOdometry(Node):
         self.declare_parameter('counts_per_rev', 2400)
         self.declare_parameter('left_offset', 0.0970)
         self.declare_parameter('right_offset', 0.0934)
-
+        self.declare_parameter('publish_tf', True)
+        self.publish_tf = self.get_parameter('publish_tf').value
+        
         self.tf_broadcaster = TransformBroadcaster(self)
 
         radius = self.get_parameter('wheel_radius').value
@@ -136,6 +136,11 @@ class WheelOdometry(Node):
             odom.pose.covariance[i * 7] = 1e6
             odom.twist.covariance[i * 7] = 1e6
 
+        # Velocity measurement variances
+        odom.twist.covariance[0] = 0.0025   # vx
+        odom.twist.covariance[7] = 0.0001   # vy
+        odom.twist.covariance[35] = 0.0025  # yaw rate
+
         self.publisher.publish(odom)
 
         transform = TransformStamped()
@@ -149,9 +154,13 @@ class WheelOdometry(Node):
 
         transform.transform.rotation = odom.pose.pose.orientation
 
-        self.tf_broadcaster.sendTransform(transform)
+        if self.publish_tf:
+            self.tf_broadcaster.sendTransform(transform)
 
-
+        # Stationary vehicle constraint
+        if dl == 0.0 and dr == 0.0:
+            odom.twist.covariance[0] = 0.00001
+            odom.twist.covariance[35] = 0.00001
 
         # Update trajectory
         pose = PoseStamped()
