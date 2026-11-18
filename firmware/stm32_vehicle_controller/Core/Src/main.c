@@ -161,6 +161,9 @@ static float my_corrected;
 static float mz_corrected;
 
 static uint32_t last_telemetry_ms = 0;
+
+static uint8_t rx_needs_neutral = 0;
+static uint32_t rx_recoveries = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -495,6 +498,49 @@ static void apply_vehicle_command(int16_t steering, int16_t throttle)
     drive_direction = requested_direction;
 }
 
+static void uart_recover(void)
+{
+    // Stop the vehicle
+    apply_vehicle_command(0, 0);
+    watchdog_active = 1;
+    rx_needs_neutral = 1;
+
+    HAL_NVIC_DisableIRQ(USART2_IRQn);
+
+    if (HAL_UART_AbortReceive(&huart2) == HAL_OK)
+    {
+        __HAL_UART_CLEAR_FLAG(
+            &huart2,
+            UART_CLEAR_OREF | UART_CLEAR_FEF |
+            UART_CLEAR_NEF | UART_CLEAR_PEF
+        );
+
+        __HAL_UART_SEND_REQ(
+            &huart2, UART_RXDATA_FLUSH_REQUEST
+        );
+
+        // Reset reception buffers
+        rx_head = 0;
+        rx_tail = 0;
+        rx_index = 0;
+        rx_discard = 1;
+
+        rx_fault = 0;
+
+        if (HAL_UART_Receive_IT(
+                &huart2, &rx_byte, 1) == HAL_OK)
+        {
+            rx_recoveries++;
+        }
+        else
+        {
+            rx_fault = 1;
+        }
+    }
+
+    HAL_NVIC_EnableIRQ(USART2_IRQn);
+}
+
 
 static void send_status(void)
 {
@@ -526,6 +572,17 @@ static void process_command(char *line)
 
     if (sscanf(line, "C,%d,%d", &steering, &throttle) == 2)
     {
+    	if (rx_fault)
+    	    return;
+
+    	if (rx_needs_neutral)
+    	{
+    	    if (steering != 0 || throttle != 0)
+    	        return;
+
+    	    rx_needs_neutral = 0;
+    	}
+
         apply_vehicle_command(
             (int16_t)steering,
             (int16_t)throttle
@@ -536,6 +593,7 @@ static void process_command(char *line)
 
         send_status();
     }
+
 }
 
 static uint8_t ak8963_read_raw(void)
@@ -778,10 +836,9 @@ int main(void)
 	      }
 	  }
 
-	  if (rx_fault && !watchdog_active)
+	  if (rx_fault)
 	  {
-	      apply_vehicle_command(0, 0);
-	      watchdog_active = 1;
+	      uart_recover();
 	  }
 
 	  if (
@@ -800,11 +857,13 @@ int main(void)
 		  char msg[100];
 
 		  int len = snprintf(
-			  msg, sizeof(msg),
-			  "DEBUG RX=%lu FAULT=%u ERROR=0x%lX\r\n",
-			  (unsigned long)rx_count,
-			  (unsigned int)rx_fault,
-			  (unsigned long)rx_error
+		      msg, sizeof(msg),
+		      "DEBUG RX=%lu FAULT=%u ERROR=0x%lX REC=%lu ARM=%u\r\n",
+		      (unsigned long)rx_count,
+		      (unsigned int)rx_fault,
+		      (unsigned long)rx_error,
+		      (unsigned long)rx_recoveries,
+		      (unsigned int)(!rx_needs_neutral && !rx_fault)
 		  );
 
 		  HAL_UART_Transmit(
