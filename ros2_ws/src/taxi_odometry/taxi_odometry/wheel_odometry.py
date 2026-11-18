@@ -11,6 +11,9 @@ from tf2_ros import TransformBroadcaster
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped
 
+from nav_msgs.msg import Path
+from geometry_msgs.msg import PoseStamped
+
 
 class WheelOdometry(Node):
 
@@ -56,6 +59,14 @@ class WheelOdometry(Node):
             self.encoder_callback,
             10
         )
+
+        # Trajectory publisher
+        self.path_pub = self.create_publisher(Path, 'odom/path', 10)
+
+        self.path = Path()
+        self.path.header.frame_id = 'odom'
+
+        self.path_timer = self.create_timer(0.5, self.publish_path)
 
     def encoder_callback(self, msg):
 
@@ -140,25 +151,29 @@ class WheelOdometry(Node):
 
         self.tf_broadcaster.sendTransform(transform)
 
-        # Update vehicle trajectory
-    pose = PoseStamped()
-    pose.header = odom.header
-    pose.pose = odom.pose.pose
 
-    self.path.header.stamp = odom.header.stamp
 
-    if not self.path.poses or math.hypot(
-        self.x - self.path.poses[-1].pose.position.x,
-        self.y - self.path.poses[-1].pose.position.y
-    ) >= 0.01:
+        # Update trajectory
+        pose = PoseStamped()
+        pose.header = odom.header
+        pose.pose = odom.pose.pose
 
-        self.path.poses.append(pose)
+        self.path.header.stamp = odom.header.stamp
 
-        if len(self.path.poses) > 2000:
-            self.path.poses.pop(0)
+        if not self.path.poses or math.hypot(
+            self.x - self.path.poses[-1].pose.position.x,
+            self.y - self.path.poses[-1].pose.position.y
+        ) >= 0.01:
 
-    self.path_pub.publish(self.path)
+            self.path.poses.append(pose)
 
+            if len(self.path.poses) > 2000:
+                self.path.poses.pop(0)
+
+        
+    def publish_path(self):
+        if self.path.poses:
+            self.path_pub.publish(self.path)
 
 def main(args=None):
     rclpy.init(args=args)
