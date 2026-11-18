@@ -32,7 +32,43 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define MPU9250_ADDR          (0x68 << 1)
+#define MPU9250_WHO_AM_I      0x75
+#define MPU9250_PWR_MGMT_1    0x6B
+#define MPU9250_TIMEOUT_MS    10
+#define MPU9250_ACCEL_XOUT_H   0x3B
+#define UART_RX_RING_SIZE 256
+#define GYRO_BIAS_X    (-93.59f)
+#define GYRO_BIAS_Y    (193.61f)
+#define GYRO_BIAS_Z    (-44.02f)
+#define ACCEL_BIAS_X    433.2640f
+#define ACCEL_BIAS_Y    369.6160f
+#define ACCEL_BIAS_Z    4045.8200f
 
+#define ACCEL_SCALE_X   0.999424f
+#define ACCEL_SCALE_Y   1.000798f
+#define ACCEL_SCALE_Z   0.983851f
+
+#define MPU9250_USER_CTRL      0x6A
+#define MPU9250_INT_PIN_CFG    0x37
+
+#define AK8963_ADDR           (0x0C << 1)
+#define AK8963_WIA            0x00
+
+#define AK8963_ST1           0x02
+#define AK8963_HXL           0x03
+#define AK8963_CNTL1         0x0A
+#define AK8963_ASAX          0x10
+
+#define MAG_BIAS_X     34.956988f
+#define MAG_BIAS_Y     55.816963f
+#define MAG_BIAS_Z   -342.012000f
+
+#define MAG_SCALE_X    0.974791f
+#define MAG_SCALE_Y    1.038557f
+#define MAG_SCALE_Z    1.025115f
+
+#define TELEMETRY_PERIOD_MS 100
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -82,7 +118,52 @@ int8_t drive_direction = 0;
 //  0 = neutral
 // +1 = forward
 
-static uint32_t last_encoder_print_ms = 0;
+static uint32_t prev_left = 0;
+static uint16_t prev_right = 0;
+
+static int64_t total_left = 0;
+static int64_t total_right = 0;
+
+static uint8_t imu_ready = 0;
+
+static int16_t ax, ay, az;
+static int16_t gx, gy, gz;
+
+static volatile uint8_t rx_ring[UART_RX_RING_SIZE];
+
+static volatile uint8_t rx_head = 0;
+static volatile uint8_t rx_tail = 0;
+
+static volatile uint8_t rx_fault = 0;
+static uint8_t rx_discard = 0;
+
+
+static volatile uint32_t rx_count = 0;
+static volatile uint32_t rx_error = 0;
+static uint32_t last_debug_ms = 0;
+
+static float gx_corrected;
+static float gy_corrected;
+static float gz_corrected;
+
+static float ax_corrected;
+static float ay_corrected;
+static float az_corrected;
+
+static uint8_t mag_ready = 0;
+
+static int16_t mx, my, mz;
+
+static float mag_adjust[3];
+
+static float mx_corrected;
+static float my_corrected;
+static float mz_corrected;
+
+static uint32_t last_telemetry_ms = 0;
+
+static uint8_t rx_needs_neutral = 0;
+static uint32_t rx_recoveries = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -99,6 +180,208 @@ static void MX_TIM2_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void int64_to_string(int64_t value, char *out)
+{
+    char temp[21];
+    int i = 0;
+
+    uint64_t magnitude = value < 0
+        ? (uint64_t)(-(value + 1)) + 1
+        : (uint64_t)value;
+
+    if (value < 0)
+        *out++ = '-';
+
+    do
+    {
+        temp[i++] = '0' + magnitude % 10;
+        magnitude /= 10;
+    }
+    while (magnitude > 0);
+
+    while (i > 0)
+        *out++ = temp[--i];
+
+    *out = '\0';
+}
+static uint8_t ak8963_detect(void)
+{
+    uint8_t data;
+
+    // Disable internal I2C master
+    data = 0x00;
+
+    if (HAL_I2C_Mem_Write(
+            &hi2c1,
+            MPU9250_ADDR,
+            MPU9250_USER_CTRL,
+            I2C_MEMADD_SIZE_8BIT,
+            &data, 1, MPU9250_TIMEOUT_MS) != HAL_OK)
+    {
+        return 0;
+    }
+
+    // Enable bypass mode
+    data = 0x02;
+
+    if (HAL_I2C_Mem_Write(
+            &hi2c1,
+            MPU9250_ADDR,
+            MPU9250_INT_PIN_CFG,
+            I2C_MEMADD_SIZE_8BIT,
+            &data, 1, MPU9250_TIMEOUT_MS) != HAL_OK)
+    {
+        return 0;
+    }
+
+    // Read magnetometer device ID
+    data = 0;
+
+    if (HAL_I2C_Mem_Read(
+            &hi2c1,
+            AK8963_ADDR,
+            AK8963_WIA,
+            I2C_MEMADD_SIZE_8BIT,
+            &data, 1, MPU9250_TIMEOUT_MS) != HAL_OK)
+    {
+        return 0;
+    }
+
+    return data == 0x48;
+}
+
+static uint8_t ak8963_set_mode(uint8_t mode)
+{
+    return HAL_I2C_Mem_Write(
+        &hi2c1,
+        AK8963_ADDR,
+        AK8963_CNTL1,
+        I2C_MEMADD_SIZE_8BIT,
+        &mode, 1, MPU9250_TIMEOUT_MS
+    ) == HAL_OK;
+}
+
+static uint8_t ak8963_init(void)
+{
+    uint8_t asa[3];
+
+    // Power-down mode
+    if (!ak8963_set_mode(0x00))
+        return 0;
+
+    HAL_Delay(1);
+
+    // Fuse ROM access mode
+    if (!ak8963_set_mode(0x0F))
+        return 0;
+
+    HAL_Delay(1);
+
+    // Read factory sensitivity adjustment
+    if (HAL_I2C_Mem_Read(
+            &hi2c1,
+            AK8963_ADDR,
+            AK8963_ASAX,
+            I2C_MEMADD_SIZE_8BIT,
+            asa, 3, MPU9250_TIMEOUT_MS) != HAL_OK)
+    {
+        return 0;
+    }
+
+    for (int i = 0; i < 3; i++)
+    {
+        mag_adjust[i] =
+            ((float)asa[i] - 128.0f) / 256.0f + 1.0f;
+    }
+
+    // Return to power-down mode
+    if (!ak8963_set_mode(0x00))
+        return 0;
+
+    HAL_Delay(1);
+
+    // Continuous measurement, 100 Hz, 16 bits
+    if (!ak8963_set_mode(0x16))
+        return 0;
+
+    return 1;
+}
+
+static uint8_t mpu9250_read_raw(void)
+{
+    uint8_t data[14];
+
+    if (HAL_I2C_Mem_Read(
+            &hi2c1,
+            MPU9250_ADDR,
+            MPU9250_ACCEL_XOUT_H,
+            I2C_MEMADD_SIZE_8BIT,
+            data,
+            14,
+            MPU9250_TIMEOUT_MS) != HAL_OK)
+    {
+        return 0;
+    }
+
+    ax = (int16_t)((data[0] << 8) | data[1]);
+    ay = (int16_t)((data[2] << 8) | data[3]);
+    az = (int16_t)((data[4] << 8) | data[5]);
+
+    gx = (int16_t)((data[8] << 8) | data[9]);
+    gy = (int16_t)((data[10] << 8) | data[11]);
+    gz = (int16_t)((data[12] << 8) | data[13]);
+
+    gx_corrected = (float)gx - GYRO_BIAS_X;
+    gy_corrected = (float)gy - GYRO_BIAS_Y;
+    gz_corrected = (float)gz - GYRO_BIAS_Z;
+
+    ax_corrected = ((float)ax - ACCEL_BIAS_X) * ACCEL_SCALE_X;
+    ay_corrected = ((float)ay - ACCEL_BIAS_Y) * ACCEL_SCALE_Y;
+    az_corrected = ((float)az - ACCEL_BIAS_Z) * ACCEL_SCALE_Z;
+
+    return 1;
+}
+
+
+static uint8_t mpu9250_init(void)
+{
+    uint8_t who_am_i = 0;
+
+    if (HAL_I2C_Mem_Read(
+            &hi2c1,
+            MPU9250_ADDR,
+            MPU9250_WHO_AM_I,
+            I2C_MEMADD_SIZE_8BIT,
+            &who_am_i,
+            1,
+            MPU9250_TIMEOUT_MS) != HAL_OK)
+    {
+        return 0;
+    }
+
+    if (who_am_i != 0x71)
+    {
+        return 0;
+    }
+
+    uint8_t data = 0x00;
+
+    if (HAL_I2C_Mem_Write(
+            &hi2c1,
+            MPU9250_ADDR,
+            MPU9250_PWR_MGMT_1,
+            I2C_MEMADD_SIZE_8BIT,
+            &data,
+            1,
+            MPU9250_TIMEOUT_MS) != HAL_OK)
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+
 static int16_t clamp_command(int value)
 {
     if (value > COMMAND_MAX)
@@ -215,6 +498,49 @@ static void apply_vehicle_command(int16_t steering, int16_t throttle)
     drive_direction = requested_direction;
 }
 
+static void uart_recover(void)
+{
+    // Stop the vehicle
+    apply_vehicle_command(0, 0);
+    watchdog_active = 1;
+    rx_needs_neutral = 1;
+
+    HAL_NVIC_DisableIRQ(USART2_IRQn);
+
+    if (HAL_UART_AbortReceive(&huart2) == HAL_OK)
+    {
+        __HAL_UART_CLEAR_FLAG(
+            &huart2,
+            UART_CLEAR_OREF | UART_CLEAR_FEF |
+            UART_CLEAR_NEF | UART_CLEAR_PEF
+        );
+
+        __HAL_UART_SEND_REQ(
+            &huart2, UART_RXDATA_FLUSH_REQUEST
+        );
+
+        // Reset reception buffers
+        rx_head = 0;
+        rx_tail = 0;
+        rx_index = 0;
+        rx_discard = 1;
+
+        rx_fault = 0;
+
+        if (HAL_UART_Receive_IT(
+                &huart2, &rx_byte, 1) == HAL_OK)
+        {
+            rx_recoveries++;
+        }
+        else
+        {
+            rx_fault = 1;
+        }
+    }
+
+    HAL_NVIC_EnableIRQ(USART2_IRQn);
+}
+
 
 static void send_status(void)
 {
@@ -246,6 +572,17 @@ static void process_command(char *line)
 
     if (sscanf(line, "C,%d,%d", &steering, &throttle) == 2)
     {
+    	if (rx_fault)
+    	    return;
+
+    	if (rx_needs_neutral)
+    	{
+    	    if (steering != 0 || throttle != 0)
+    	        return;
+
+    	    rx_needs_neutral = 0;
+    	}
+
         apply_vehicle_command(
             (int16_t)steering,
             (int16_t)throttle
@@ -255,6 +592,118 @@ static void process_command(char *line)
         watchdog_active = 0;
 
         send_status();
+    }
+
+}
+
+static uint8_t ak8963_read_raw(void)
+{
+    uint8_t status;
+    uint8_t data[7];
+
+    if (HAL_I2C_Mem_Read(
+            &hi2c1,
+            AK8963_ADDR,
+            AK8963_ST1,
+            I2C_MEMADD_SIZE_8BIT,
+            &status, 1, MPU9250_TIMEOUT_MS) != HAL_OK)
+    {
+        return 0;
+    }
+
+    // Check data ready
+    if (!(status & 0x01))
+        return 0;
+
+    // Read measurement and ST2
+    if (HAL_I2C_Mem_Read(
+            &hi2c1,
+            AK8963_ADDR,
+            AK8963_HXL,
+            I2C_MEMADD_SIZE_8BIT,
+            data, 7, MPU9250_TIMEOUT_MS) != HAL_OK)
+    {
+        return 0;
+    }
+
+    // Reject magnetic overflow
+    if (data[6] & 0x08)
+        return 0;
+
+    mx = (int16_t)((data[1] << 8) | data[0]);
+    my = (int16_t)((data[3] << 8) | data[2]);
+    mz = (int16_t)((data[5] << 8) | data[4]);
+
+    mx_corrected = (mx * mag_adjust[0] - MAG_BIAS_X) * MAG_SCALE_X;
+
+    my_corrected = (my * mag_adjust[1] - MAG_BIAS_Y) * MAG_SCALE_Y;
+
+    mz_corrected = (mz * mag_adjust[2] - MAG_BIAS_Z) * MAG_SCALE_Z;
+
+    return 1;
+}
+
+static void telemetry_update(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    if (now - last_telemetry_ms < TELEMETRY_PERIOD_MS)
+        return;
+
+    last_telemetry_ms = now;
+
+    // Read encoders
+    uint32_t left = __HAL_TIM_GET_COUNTER(&htim2);
+    uint16_t right = HAL_LPTIM_ReadCounter(&hlptim1);
+
+    if (right != HAL_LPTIM_ReadCounter(&hlptim1))
+        return;
+
+    // Handle counter wraparound
+    total_left += (int32_t)(left - prev_left);
+    total_right += (int16_t)(right - prev_right);
+
+    prev_left = left;
+    prev_right = right;
+
+    // Read sensors
+    uint8_t imu_valid = imu_ready && mpu9250_read_raw();
+    uint8_t mag_valid = mag_ready && ak8963_read_raw();
+
+    // Format encoder counters
+    char left_str[22];
+    char right_str[22];
+
+    int64_to_string(total_left, left_str);
+    int64_to_string(total_right, right_str);
+
+    // Build telemetry packet
+    char msg[192];
+
+    int len = snprintf(
+        msg, sizeof(msg),
+        "T,%lu,%s,%s,%u,%d,%d,%d,%d,%d,%d,%u,%d,%d,%d\r\n",
+        (unsigned long)now,
+        left_str,
+        right_str,
+        (unsigned int)imu_valid,
+        imu_valid ? (int)ax_corrected : 0,
+        imu_valid ? (int)ay_corrected : 0,
+        imu_valid ? (int)az_corrected : 0,
+        imu_valid ? (int)gx_corrected : 0,
+        imu_valid ? (int)gy_corrected : 0,
+        imu_valid ? (int)gz_corrected : 0,
+        (unsigned int)mag_valid,
+        mag_valid ? (int)mx_corrected : 0,
+        mag_valid ? (int)my_corrected : 0,
+        mag_valid ? (int)mz_corrected : 0
+    );
+
+    if (len > 0 && len < (int)sizeof(msg))
+    {
+        HAL_UART_Transmit(
+            &huart2, (uint8_t *)msg, len, 20
+        );
     }
 }
 /* USER CODE END 0 */
@@ -310,6 +759,42 @@ int main(void)
   {
       Error_Handler();
   }
+
+  prev_left = __HAL_TIM_GET_COUNTER(&htim2);
+  prev_right = HAL_LPTIM_ReadCounter(&hlptim1);
+
+  imu_ready = mpu9250_init();
+
+  const char *msg = imu_ready
+      ? "IMU OK\r\n"
+      : "IMU ERROR\r\n";
+
+  HAL_UART_Transmit(
+      &huart2,
+      (uint8_t *)msg,
+      strlen(msg),
+      20
+  );
+
+  if (HAL_UART_Receive_IT(&huart2, &rx_byte, 1) != HAL_OK)
+  {
+      rx_fault = 1;
+  }
+
+  mag_ready = imu_ready &&
+              ak8963_detect() &&
+              ak8963_init();
+
+  const char *mag_msg = mag_ready
+      ? "MAG OK\r\n"
+      : "MAG ERROR\r\n";
+
+  HAL_UART_Transmit(
+      &huart2,
+      (uint8_t *)mag_msg,
+      strlen(mag_msg),
+      20
+  );
   /* USER CODE END 2 */
 
   /* Initialize leds */
@@ -319,56 +804,72 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  if (HAL_GetTick() - last_encoder_print_ms >= 100)
+	  telemetry_update();
+
+	  while (!rx_fault && rx_tail != rx_head)
 	  {
-	      last_encoder_print_ms = HAL_GetTick();
+	      uint8_t byte = rx_ring[rx_tail];
+	      rx_tail = (uint8_t)(rx_tail + 1);
 
-	      int32_t left = (int32_t)__HAL_TIM_GET_COUNTER(&htim2);
-	      int16_t right = (int16_t)HAL_LPTIM_ReadCounter(&hlptim1);
-
-	      char msg[80];
-
-	      int len = snprintf(msg, sizeof(msg),
-	                         "ENC L=%ld R=%d\r\n",
-	                         (long)left, (int)right);
-
-	      HAL_UART_Transmit(&huart2, (uint8_t *)msg, len, 10);
-	  }
-	  if (HAL_UART_Receive(&huart2, &rx_byte, 1, 1) == HAL_OK)
+	      if (byte == '\n' || byte == '\r')
 	      {
-	          if (rx_byte == '\n' || rx_byte == '\r')
+	          if (!rx_discard && rx_index > 0 && !rx_fault)
 	          {
-	              if (rx_index > 0)
-	              {
-	                  rx_buffer[rx_index] = '\0';
+	              rx_buffer[rx_index] = '\0';
+	              process_command(rx_buffer);
+	          }
 
-	                  process_command(rx_buffer);
-
-	                  rx_index = 0;
-	              }
+	          rx_index = 0;
+	          rx_discard = 0;
+	      }
+	      else if (!rx_discard)
+	      {
+	          if (rx_index < UART_BUFFER_SIZE - 1)
+	          {
+	              rx_buffer[rx_index++] = byte;
 	          }
 	          else
 	          {
-	              if (rx_index < UART_BUFFER_SIZE - 1)
-	              {
-	                  rx_buffer[rx_index++] = rx_byte;
-	              }
-	              else
-	              {
-	                  rx_index = 0;
-	              }
+	              rx_index = 0;
+	              rx_discard = 1;
 	          }
 	      }
+	  }
 
-	      if (
-	          !watchdog_active &&
-	          (HAL_GetTick() - last_command_ms > SERIAL_WATCHDOG_MS)
-	      )
-	      {
-	          apply_vehicle_command(0, 0);
+	  if (rx_fault)
+	  {
+	      uart_recover();
+	  }
 
-	          watchdog_active = 1;
-	      }
+	  if (
+		  !watchdog_active &&
+		  (HAL_GetTick() - last_command_ms > SERIAL_WATCHDOG_MS)
+	  )
+	  {
+		  apply_vehicle_command(0, 0);
+
+		  watchdog_active = 1;
+	  }
+	  if (HAL_GetTick() - last_debug_ms >= 1000)
+	  {
+		  last_debug_ms = HAL_GetTick();
+
+		  char msg[100];
+
+		  int len = snprintf(
+		      msg, sizeof(msg),
+		      "DEBUG RX=%lu FAULT=%u ERROR=0x%lX REC=%lu ARM=%u\r\n",
+		      (unsigned long)rx_count,
+		      (unsigned int)rx_fault,
+		      (unsigned long)rx_error,
+		      (unsigned long)rx_recoveries,
+		      (unsigned int)(!rx_needs_neutral && !rx_fault)
+		  );
+
+		  HAL_UART_Transmit(
+			  &huart2, (uint8_t *)msg, len, 10
+		  );
+	  }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -697,7 +1198,43 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance != USART2)
+        return;
 
+
+    rx_count++;
+
+
+    if (rx_fault)
+        return;
+
+    uint8_t next = (uint8_t)(rx_head + 1);
+
+    if (next == rx_tail)
+    {
+        rx_fault = 1;
+        return;
+    }
+
+    rx_ring[rx_head] = rx_byte;
+    rx_head = next;
+
+    if (HAL_UART_Receive_IT(&huart2, &rx_byte, 1) != HAL_OK)
+    {
+        rx_fault = 1;
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2)
+    {
+        rx_error = HAL_UART_GetError(huart);
+        rx_fault = 1;
+    }
+}
 /* USER CODE END 4 */
 
 /**

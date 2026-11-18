@@ -22,4 +22,7 @@
   <export>
     <build_type>ament_python</build_type>
   </export>
+
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>taxi_interfaces</exec_depend>
 </package>

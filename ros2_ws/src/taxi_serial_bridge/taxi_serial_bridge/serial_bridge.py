@@ -1,6 +1,10 @@
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
+import math
+
+from sensor_msgs.msg import Imu, MagneticField
+from taxi_interfaces.msg import WheelTicks
 
 import serial
 
@@ -17,7 +21,8 @@ class SerialBridge(Node):
         port = self.get_parameter('port').value
         baudrate = self.get_parameter('baudrate').value
 
-        self.ser = serial.Serial(port, baudrate, timeout=0.1)
+        self.ser = serial.Serial(port, baudrate, timeout=0, write_timeout=0.02)
+        self.rx_buffer = bytearray()
 
         self.steering = 0
         self.throttle = 0
@@ -36,6 +41,22 @@ class SerialBridge(Node):
 
         self.get_logger().info(
             f'Serial bridge connected to {port} at {baudrate} baud'
+        )
+
+        self.wheel_pub = self.create_publisher(
+            WheelTicks, 'wheel_ticks', 10
+        )
+
+        self.imu_pub = self.create_publisher(
+            Imu, 'imu/data_raw', 10
+        )
+
+        self.mag_pub = self.create_publisher(
+            MagneticField, 'imu/mag', 10
+        )
+
+        self.rx_timer = self.create_timer(
+            0.01, self.read_telemetry
         )
 
     def cmd_vel_callback(self, msg):
@@ -75,6 +96,108 @@ class SerialBridge(Node):
             self.ser.close()
 
         super().destroy_node()
+
+    def read_telemetry(self):
+        available = self.ser.in_waiting
+
+        if available == 0:
+            return
+
+        self.rx_buffer.extend(
+            self.ser.read(min(available, 4096))
+        )
+
+        while b'\n' in self.rx_buffer:
+            line, _, remaining = self.rx_buffer.partition(b'\n')
+            self.rx_buffer = bytearray(remaining)
+
+            if line.startswith(b'T,'):
+                self.process_telemetry(
+                    line.decode('ascii', errors='replace').strip()
+                )
+
+        if len(self.rx_buffer) > 256:
+            self.rx_buffer.clear()
+
+    def process_telemetry(self, line):
+        fields = line.split(',')
+
+        if len(fields) != 15:
+            return
+
+        try:
+            (
+                timestamp_ms,
+                left_ticks, right_ticks,
+                imu_valid,
+                ax, ay, az,
+                gx, gy, gz,
+                mag_valid,
+                mx, my, mz
+            ) = map(int, fields[1:])
+
+        except ValueError:
+            return
+
+        if not 0 <= timestamp_ms <= 0xFFFFFFFF:
+            return
+
+        if imu_valid not in (0, 1) or mag_valid not in (0, 1):
+            return
+
+        if not all(-2**63 <= v < 2**63
+                for v in (left_ticks, right_ticks)):
+            return
+
+        stamp = self.get_clock().now().to_msg()
+
+        # Wheel encoders
+        wheel = WheelTicks()
+        wheel.header.stamp = stamp
+        wheel.header.frame_id = 'base_link'
+
+        wheel.timestamp_ms = timestamp_ms
+        wheel.left_ticks = left_ticks
+        wheel.right_ticks = right_ticks
+
+        self.wheel_pub.publish(wheel)
+
+        # Accelerometer and gyroscope
+        if imu_valid:
+            imu = Imu()
+            imu.header.stamp = stamp
+            imu.header.frame_id = 'imu_link'
+
+            accel_scale = 9.80665 / 16384.0
+            gyro_scale = math.pi / (180.0 * 131.0)
+
+            imu.linear_acceleration.x = ax * accel_scale
+            imu.linear_acceleration.y = ay * accel_scale
+            imu.linear_acceleration.z = az * accel_scale
+
+            imu.angular_velocity.x = gx * gyro_scale
+            imu.angular_velocity.y = gy * gyro_scale
+            imu.angular_velocity.z = gz * gyro_scale
+
+            # Orientation is not estimated yet
+            imu.orientation_covariance[0] = -1.0
+
+            self.imu_pub.publish(imu)
+
+        # Magnetometer
+        if mag_valid:
+            mag = MagneticField()
+            mag.header.stamp = stamp
+            mag.header.frame_id = 'imu_link'
+
+            mag_scale = 0.15e-6
+
+            # Align AK8963 axes with MPU9250 axes
+            mag.magnetic_field.x = my * mag_scale
+            mag.magnetic_field.y = mx * mag_scale
+            mag.magnetic_field.z = -mz * mag_scale
+
+            self.mag_pub.publish(mag)
 
 
 def main(args=None):
