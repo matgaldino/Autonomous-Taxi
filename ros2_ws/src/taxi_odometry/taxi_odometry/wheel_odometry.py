@@ -20,7 +20,7 @@ class WheelOdometry(Node):
     def __init__(self):
         super().__init__('wheel_odometry')
 
-        self.declare_parameter('wheel_radius', 0.0305)
+        self.declare_parameter('wheel_radius', 0.0308)
         self.declare_parameter('counts_per_rev', 2400)
         self.declare_parameter('left_offset', 0.0970)
         self.declare_parameter('right_offset', 0.0934)
